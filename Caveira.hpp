@@ -135,7 +135,7 @@ namespace Caveira {
             LIST_ENTRY* module_list = &peb->ldr->InMemoryOrderModuleList;
 
             for (LIST_ENTRY* entry = module_list->Flink; entry != module_list; entry = entry->Flink) {
-                auto ldr_entry = GET_CONTAINER(entry, FullLdrDataTableEntry, in_memory_order_links);
+                auto ldr_entry = GET_CONTAINER(entry, LdrDataTableEntry, in_memory_order_links);
                 uintptr_t func_addr = reinterpret_cast<uintptr_t>(
                     parse_export_table(reinterpret_cast<uintptr_t>(ldr_entry->dll_base), target_hash)
                 );
