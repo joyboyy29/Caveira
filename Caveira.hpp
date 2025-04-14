@@ -3,6 +3,7 @@
 #include <Windows.h>
 #include <winternl.h>
 #include <cstddef>
+#include <string_view>
 
 namespace Caveira {
 
@@ -62,7 +63,7 @@ namespace Caveira {
         ULONG size_of_image;
         UNICODE_STRING full_dll_name;
         UNICODE_STRING base_dll_name;
-        // ... 
+        // ...
     };
 
     // --- Compile-Time Randomization Utilities ---
@@ -84,7 +85,7 @@ namespace Caveira {
         static constexpr unsigned value = Seed;
     };
 
-    inline constexpr unsigned generate_seed() {
+    __forceinline consteval unsigned generate_seed() {
         return RandomGenerator<CT_RANDOM_NUMBER, CT_RANDOM_SEED>::value;
     }
 
@@ -104,57 +105,92 @@ namespace Caveira {
         }
     };
 
+    template <uint64_t Seed>
+    __forceinline LPVOID parse_export_table(uintptr_t module_base, uint64_t target_hash) {
+        auto dos_header = reinterpret_cast<IMAGE_DOS_HEADER*>(module_base);
+        auto nt_header = reinterpret_cast<IMAGE_NT_HEADERS*>(module_base + dos_header->e_lfanew);
+        auto& export_dir_data = nt_header->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+
+        if (!export_dir_data.VirtualAddress)
+            return nullptr;
+
+        auto export_dir = reinterpret_cast<IMAGE_EXPORT_DIRECTORY*>(module_base + export_dir_data.VirtualAddress);
+        auto function_array = reinterpret_cast<uint32_t*>(module_base + export_dir->AddressOfFunctions);
+        auto name_array = reinterpret_cast<uint32_t*>(module_base + export_dir->AddressOfNames);
+        auto ordinal_array = reinterpret_cast<uint16_t*>(module_base + export_dir->AddressOfNameOrdinals);
+
+        for (uint32_t i = 0; i < export_dir->NumberOfNames; ++i) {
+            const char* func_name = reinterpret_cast<const char*>(module_base + name_array[i]);
+            if (CompileTimeHash<Seed>::hash(func_name) == target_hash)
+                return reinterpret_cast<LPVOID>(module_base + function_array[ordinal_array[i]]);
+        }
+        return nullptr;
+    }
+
     // --- Import Resolver ---
     template <uint64_t Seed>
     class ImportResolver {
     public:
-        static inline LPVOID parse_export_table(uintptr_t module_base, uint64_t target_hash) {
-            auto dos_header = reinterpret_cast<IMAGE_DOS_HEADER*>(module_base);
-            auto nt_header = reinterpret_cast<IMAGE_NT_HEADERS*>(module_base + dos_header->e_lfanew);
-            auto export_dir_data = nt_header->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
-
-            if (export_dir_data.VirtualAddress == 0)
-                return nullptr;
-
-            auto export_dir = reinterpret_cast<IMAGE_EXPORT_DIRECTORY*>(module_base + export_dir_data.VirtualAddress);
-            auto function_array = reinterpret_cast<uint32_t*>(module_base + export_dir->AddressOfFunctions);
-            auto name_array = reinterpret_cast<uint32_t*>(module_base + export_dir->AddressOfNames);
-            auto ordinal_array = reinterpret_cast<uint16_t*>(module_base + export_dir->AddressOfNameOrdinals);
-
-            for (uint32_t i = 0; i < export_dir->NumberOfNames; ++i) {
-                const char* func_name = reinterpret_cast<const char*>(module_base + name_array[i]);
-                uint64_t computed_hash = CompileTimeHash<Seed>::hash(func_name);
-                if (computed_hash == target_hash)
-                    return reinterpret_cast<LPVOID>(module_base + function_array[ordinal_array[i]]);
-            }
-            return nullptr;
-        }
-
-        static inline uintptr_t resolve_import(uint64_t target_hash) {
+        __forceinline static uintptr_t resolve_import(uint64_t target_hash) {
             PEB64* peb = reinterpret_cast<PEB64*>(__readgsqword(0x60));
             LIST_ENTRY* module_list = &peb->ldr->InMemoryOrderModuleList;
 
             for (LIST_ENTRY* entry = module_list->Flink; entry != module_list; entry = entry->Flink) {
                 auto ldr_entry = GET_CONTAINER(entry, LdrDataTableEntry, in_memory_order_links);
-                uintptr_t func_addr = reinterpret_cast<uintptr_t>(
-                    parse_export_table(reinterpret_cast<uintptr_t>(ldr_entry->dll_base), target_hash)
-                );
-                if (func_addr)
-                    return func_addr;
+                auto base = reinterpret_cast<uint64_t>(ldr_entry->dll_base);
+                auto result = parse_export_table<Seed>(base, target_hash);
+                if (result)
+                    return (uintptr_t)result;
             }
             return 0;
         }
     };
 
+    __forceinline uintptr_t get_module_by_name(std::wstring_view target_name);
+
+    template <uint64_t Seed>
+    __forceinline uintptr_t get_export_by_hash(uintptr_t module_base, uint64_t hash) {
+        return reinterpret_cast<uintptr_t>(parse_export_table<Seed>(module_base, hash));
+    }
+
     // --- Macro Helpers ---
-    #define CAVEIRA_HASH(func_str, seed) ([]() constexpr -> uint64_t { \
+    #define CAVEIRA_HASH(func_str, seed) ([]() consteval -> uint64_t { \
         return Caveira::CompileTimeHash<seed>::hash(func_str); \
     }())
 
     #define CAVEIRA_IMPORT(func) ([]() -> decltype(&func) { \
-        constexpr unsigned int seed = Caveira::generate_seed(); \
-        constexpr uint64_t hash_val = Caveira::CompileTimeHash<seed>::hash(#func); \
+        constexpr auto seed = Caveira::generate_seed(); \
+        constexpr auto hash_val = Caveira::CompileTimeHash<seed>::hash(#func); \
         return reinterpret_cast<decltype(&func)>(Caveira::ImportResolver<seed>::resolve_import(hash_val)); \
     }())
+
+    #define CAVEIRA_IMPORT_NAME(func_str) ([]() -> uintptr_t { \
+        constexpr auto seed = Caveira::generate_seed(); \
+        constexpr auto hash_val = Caveira::CompileTimeHash<seed>::hash(func_str); \
+        return Caveira::ImportResolver<seed>::resolve_import(hash_val); \
+    }())
+
+    #define CAVEIRA_IMPORT_FROM(dll_name, func_str) ([]() -> uintptr_t { \
+        constexpr auto seed = Caveira::generate_seed(); \
+        constexpr auto hash_val = Caveira::CompileTimeHash<seed>::hash(func_str); \
+        uintptr_t mod = Caveira::get_module_by_name(L ## dll_name); \
+        return Caveira::get_export_by_hash<seed>(mod, hash_val); \
+    }())
+
+    __forceinline uintptr_t get_module_by_name(std::wstring_view target_name) {
+        PEB64* peb = reinterpret_cast<PEB64*>(__readgsqword(0x60));
+        LIST_ENTRY* module_list = &peb->ldr->InMemoryOrderModuleList;
+
+        for (LIST_ENTRY* entry = module_list->Flink; entry != module_list; entry = entry->Flink) {
+            auto ldr_entry = GET_CONTAINER(entry, LdrDataTableEntry, in_memory_order_links);
+            std::wstring_view mod_name(
+                ldr_entry->base_dll_name.Buffer,
+                ldr_entry->base_dll_name.Length / sizeof(wchar_t)
+            );
+            if (_wcsnicmp(mod_name.data(), target_name.data(), target_name.length()) == 0)
+                return reinterpret_cast<uintptr_t>(ldr_entry->dll_base);
+        }
+        return 0;
+    }
 
 }
